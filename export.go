@@ -258,6 +258,10 @@ func (f *File) CodeSign(config *codesign.Config) error {
 		return fmt.Errorf("failed to find __LINKEDIT segment")
 	}
 
+	if config.ResourceDirSlotHash != nil {
+		config.SlotHashes.ResourceDir = config.ResourceDirSlotHash
+	}
+
 	if cs = f.CodeSignature(); cs != nil { // existing code signature
 		// import settings from existing code signature
 		if len(cs.CodeDirectories) > 0 {
@@ -276,16 +280,34 @@ func (f *File) CodeSign(config *codesign.Config) error {
 			if config.EntitlementsDER == nil {
 				config.EntitlementsDER = []byte(cs.EntitlementsDER)
 			}
-			if config.ResourceDirSlotHash != nil {
-				config.SlotHashes.ResourceDir = config.ResourceDirSlotHash
-			}
 			if config.SpecialSlots == nil {
 				config.SpecialSlots = cs.CodeDirectories[0].SpecialSlots
+			}
+			if config.RuntimeVersion == 0 {
+				if cs.CodeDirectories[0].Header.Runtime != 0 {
+					config.RuntimeVersion = cs.CodeDirectories[0].Header.Runtime
+				} else if bv := f.BuildVersion(); bv != nil {
+					config.RuntimeVersion = bv.Sdk
+				} else if vm := f.VersionMin(); vm != nil {
+					config.RuntimeVersion = vm.Sdk
+				}
 			}
 		}
 	} else { // create NEW code signature
 		if config.ID == "" {
 			return fmt.Errorf("you must supply an ID")
+		}
+		// infer runtime version from build or min version load commands if necessary
+		if config.Flags & ctypes.RUNTIME != 0 {
+			if config.RuntimeVersion == 0 {
+				if bv := f.BuildVersion(); bv != nil {
+					config.RuntimeVersion = bv.Sdk
+				} else if vm := f.VersionMin(); vm != nil {
+					config.RuntimeVersion = vm.Sdk
+				}
+			}
+		} else {
+			config.RuntimeVersion = 0
 		}
 		cs = &CodeSignature{
 			CodeSignatureCmd: types.CodeSignatureCmd{
@@ -310,7 +332,7 @@ func (f *File) CodeSign(config *codesign.Config) error {
 	f.ledata = bytes.NewBuffer(ledata[:(uint64(cs.Offset) - linkedit.Offset)])
 
 	// update __LINKEDIT segment sizes
-	linkedit.Filesz = pageAlign(uint64(len(ledata)), 0x4000) // TODO: is this enough padding to hold the new signature?
+	linkedit.Filesz = pageAlign(uint64(len(ledata)) + codesign.EstimateCodeSignatureSize(config), 0x4000)
 	linkedit.Memsz = pageAlign(linkedit.Filesz, 0x8000)
 	// update LC_CODE_SIGNATURE size
 	cs.Size = uint32((linkedit.Offset + linkedit.Filesz) - uint64(cs.Offset))

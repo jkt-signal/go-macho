@@ -12,6 +12,7 @@ import (
 	"io"
 	"strings"
 
+	mtypes "github.com/blacktop/go-macho/types"
 	"github.com/blacktop/go-macho/pkg/codesign/types"
 )
 
@@ -434,6 +435,7 @@ type Config struct {
 	EntitlementsDER     []byte
 	ResourceDirSlotHash []byte
 	SlotHashes          slotHashes
+	RuntimeVersion mtypes.Version
 	CertChain           []*x509.Certificate
 	SignerFunction      func([]byte) ([]byte, error)
 }
@@ -547,6 +549,28 @@ func Sign(r io.Reader, config *Config) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func nCodeSlots(config *Config) uint32 {
+	return uint32((int(config.CodeSize) + types.PAGE_SIZE - 1) / types.PAGE_SIZE)
+}
+
+func EstimateCodeSignatureSize(config *Config) uint64 {
+	cdHeaderSize := binary.Size(types.BlobHeader{}) + binary.Size(types.CodeDirectoryType{})
+	cdVariableSize := len(config.ID)+1+ len(types.EmptySha256Slot)*int(config.NSpecialSlots + nCodeSlots(config))
+	extraSlotsSize := 0
+	if len(config.Entitlements) > 0 {
+		extraSlotsSize += binary.Size(types.BlobHeader{}) + len(config.Entitlements)
+	}
+	if len(config.EntitlementsDER) > 0 {
+		extraSlotsSize += binary.Size(types.BlobHeader{}) + len(config.EntitlementsDER)
+	}
+	extraSlotsSize += 1024		// guess at maximum size of requirements
+	sigSize := 1<<14			// guess at size of CMS blob, including timestamp
+	for _, cert := range config.CertChain {
+		sigSize += len(cert.Raw)
+	}
+	return uint64(cdHeaderSize + cdVariableSize + extraSlotsSize + sigSize)
+}
+
 func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 	var cddelta int
 	var cdbuf bytes.Buffer
@@ -604,12 +628,12 @@ func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 
 	cdHeader := types.CodeDirectoryType{
 		CdEarliest: types.CdEarliest{
-			Version:       types.SUPPORTS_EXECSEG, // TODO: support other versions (e.g.SUPPORTS_RUNTIME)
+			Version:       types.SUPPORTS_RUNTIME, // TODO: support other versions (e.g.SUPPORTS_LINKAGE)
 			Flags:         config.Flags,
 			HashOffset:    hashOffset,
 			IdentOffset:   identOffset,
 			NSpecialSlots: config.NSpecialSlots,
-			NCodeSlots:    uint32((int(config.CodeSize) + types.PAGE_SIZE - 1) / types.PAGE_SIZE),
+			NCodeSlots:    nCodeSlots(config),
 			CodeLimit:     uint32(config.CodeSize),
 			HashSize:      sha256.Size,
 			HashType:      types.HASHTYPE_SHA256,
@@ -621,6 +645,9 @@ func createCodeDirectory(r io.Reader, config *Config) (*bytes.Buffer, error) {
 		CdExecSeg: types.CdExecSeg{
 			ExecSegBase:  uint64(config.TextOffset),
 			ExecSegLimit: uint64(config.TextSize),
+		},
+		CdRuntime: types.CdRuntime{
+			Runtime: config.RuntimeVersion,
 		},
 	}
 
